@@ -1,0 +1,18 @@
+# 可执行文件
+rtsp_ai_transcoder
+rtsp_ai_transcoder_udp
+rtsp_ai_transcoder_tcp
+
+# 模型文件（太大，不上传，在 README 里说明下载方式）
+*.onnx
+*.pt
+
+# 测试视频
+*.mp4
+*.flv
+
+# 系统/编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
