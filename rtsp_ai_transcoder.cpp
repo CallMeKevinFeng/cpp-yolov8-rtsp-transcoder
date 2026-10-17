@@ -17,7 +17,7 @@ extern "C" {
 
 // ==================== 传输协议开关 ====================
 // 默认使用 UDP（低延迟）。若要改为 TCP（不丢包），取消下面这行的注释：
-// #define USE_TCP_FOR_RTSP
+#define USE_TCP_FOR_RTSP
 // =====================================================
 
 // ==================== YOLOv8 参数 ====================
@@ -67,6 +67,89 @@ static std::vector<Detection> nms(std::vector<Detection>& dets, float iou_thres)
     return result;
 }
 
+// ==================== RTSP 连接函数 ====================
+static bool open_rtsp_input(AVFormatContext** ctx, AVCodecContext** dec,
+                            const char* url, int& video_idx) {
+    AVDictionary* opts = NULL;
+#ifdef USE_TCP_FOR_RTSP
+    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opts, "buffer_size", "1024000", 0);
+    av_dict_set(&opts, "max_delay", "500000", 0);
+    av_dict_set(&opts, "stimeout", "5000000", 0);
+#endif
+
+    if (avformat_open_input(ctx, url, NULL, &opts) < 0) {
+        av_dict_free(&opts);
+        return false;
+    }
+    av_dict_free(&opts);
+
+    if (avformat_find_stream_info(*ctx, NULL) < 0) {
+        avformat_close_input(ctx);
+        return false;
+    }
+
+    video_idx = -1;
+    for (unsigned i = 0; i < (*ctx)->nb_streams; i++) {
+        if ((*ctx)->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_idx = i;
+            break;
+        }
+    }
+    if (video_idx < 0) {
+        avformat_close_input(ctx);
+        return false;
+    }
+
+    AVCodecParameters* par = (*ctx)->streams[video_idx]->codecpar;
+    const AVCodec* decoder = avcodec_find_decoder(par->codec_id);
+    if (!decoder) {
+        avformat_close_input(ctx);
+        return false;
+    }
+    *dec = avcodec_alloc_context3(decoder);
+    avcodec_parameters_to_context(*dec, par);
+    (*dec)->pkt_timebase = (*ctx)->streams[video_idx]->time_base;
+    if (avcodec_open2(*dec, decoder, NULL) < 0) {
+        avcodec_free_context(dec);
+        avformat_close_input(ctx);
+        return false;
+    }
+    return true;
+}
+
+// ==================== RTMP 连接函数 ====================
+static bool open_rtmp_output(AVFormatContext** out_ctx, AVStream** out_stream,
+                             AVCodecContext* enc_ctx, const char* url) {
+    if (*out_ctx) {
+        if ((*out_ctx)->pb) avio_closep(&(*out_ctx)->pb);
+        avformat_free_context(*out_ctx);
+        *out_ctx = NULL;
+    }
+
+    if (avformat_alloc_output_context2(out_ctx, NULL, "flv", url) < 0 || !*out_ctx) {
+        return false;
+    }
+
+    *out_stream = avformat_new_stream(*out_ctx, NULL);
+    (*out_stream)->time_base = (AVRational){1, 1000};
+    avcodec_parameters_from_context((*out_stream)->codecpar, enc_ctx);
+
+    if (avio_open(&(*out_ctx)->pb, url, AVIO_FLAG_WRITE) < 0) {
+        avformat_free_context(*out_ctx);
+        *out_ctx = NULL;
+        return false;
+    }
+
+    if (avformat_write_header(*out_ctx, NULL) < 0) {
+        avio_closep(&(*out_ctx)->pb);
+        avformat_free_context(*out_ctx);
+        *out_ctx = NULL;
+        return false;
+    }
+    return true;
+}
+
 // ==================== 主函数 ====================
 int main(int argc, char* argv[]) {
     if (argc < 3) {
@@ -94,15 +177,24 @@ int main(int argc, char* argv[]) {
     uint8_t*         bgr_buffer  = NULL;
     AVRational       in_time_base = {0, 1};
     AVRational       in_framerate = {0, 1};
+    int rtmp_fail_count = 0;
+    const int RTMP_MAX_FAIL = 10;
     int video_stream_index = -1;
     int frame_count = 0;
-    int64_t pts_counter = 0;
     int ret = 0;
     int send_ret = 0;
     int write_ret = 0;
     int img_w = 0, img_h = 0;
     int bgr_linesize[4] = {0, 0, 0, 0};
     uint8_t* bgr_data[4] = {NULL, NULL, NULL, NULL};
+    // reconnect flag
+    bool just_reconnected = false;
+    AVFrame* last_frame = NULL;       // ★ 缓存最后一帧
+    bool has_last_frame = false;      // ★ 是否已有缓存
+    bool waiting_for_keyframe = false;   // ★ 新增：等待 I 帧标志
+    int64_t pts_counter = 0;
+    int64_t stream_start_us = av_gettime_relative();    // ★ 新增
+    int64_t next_frame_time_us = av_gettime_relative();   // ★ 新增：下一帧该处理的真实时间
 
     // ---------- ONNX Runtime 初始化 ----------
     Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "yolo");
@@ -140,50 +232,21 @@ int main(int argc, char* argv[]) {
     // ---------- FFmpeg 初始化 ----------
     avformat_network_init();
 
-#ifdef USE_TCP_FOR_RTSP
-    // TCP 模式：稳定，不丢包，但延迟略高
-    AVDictionary* rtsp_opts = NULL;
-    av_dict_set(&rtsp_opts, "rtsp_transport", "tcp", 0);
-    av_dict_set(&rtsp_opts, "buffer_size", "1024000", 0);
-    av_dict_set(&rtsp_opts, "max_delay", "500000", 0);
-    av_dict_set(&rtsp_opts, "stimeout", "5000000", 0);
-    if (avformat_open_input(&in_fmt_ctx, input_url, NULL, &rtsp_opts) < 0) {
-        printf("Could not open input stream (TCP): %s\n", input_url);
-        ret = -1; goto cleanup;
-    }
-    av_dict_free(&rtsp_opts);
-#else
-    // UDP 模式（默认）：低延迟，但网络丢包时会导致花屏
-    if (avformat_open_input(&in_fmt_ctx, input_url, NULL, NULL) < 0) {
-        printf("Could not open input stream (UDP): %s\n", input_url);
-        ret = -1; goto cleanup;
-    }
-#endif
+    // ==================== RTSP 首次连接（带重试） ====================
+    const int RECONNECT_DELAY_SEC = 3;
+    int reconnect_attempts = 0;
 
-    if (avformat_find_stream_info(in_fmt_ctx, NULL) < 0) {
-        printf("Could not find stream info\n");
-        ret = -1; goto cleanup;
+    while (!open_rtsp_input(&in_fmt_ctx, &dec_ctx, input_url, video_stream_index)) {
+        reconnect_attempts++;
+        printf("[RTSP] Connect failed (attempt %d), retrying in %d sec...\n",
+               reconnect_attempts, RECONNECT_DELAY_SEC);
+        av_usleep(RECONNECT_DELAY_SEC * 1000000);
     }
+    printf("[RTSP] Connected (attempt %d)\n", reconnect_attempts + 1);
 
-    for (unsigned int i = 0; i < in_fmt_ctx->nb_streams; i++) {
-        if (in_fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            video_stream_index = i;
-            break;
-        }
-    }
-    if (video_stream_index < 0) { printf("No video stream\n"); ret = -1; goto cleanup; }
-
-    in_codecpar   = in_fmt_ctx->streams[video_stream_index]->codecpar;
-    in_time_base  = in_fmt_ctx->streams[video_stream_index]->time_base;
-    in_framerate  = in_fmt_ctx->streams[video_stream_index]->avg_frame_rate;
-
-    // 解码器：CPU 软解
-    decoder = avcodec_find_decoder(in_codecpar->codec_id);
-    if (!decoder) { printf("No decoder\n"); ret = -1; goto cleanup; }
-    dec_ctx = avcodec_alloc_context3(decoder);
-    avcodec_parameters_to_context(dec_ctx, in_codecpar);
-    dec_ctx->pkt_timebase = in_time_base;
-    if (avcodec_open2(dec_ctx, decoder, NULL) < 0) { printf("Open decoder fail\n"); ret = -1; goto cleanup; }
+    in_codecpar  = in_fmt_ctx->streams[video_stream_index]->codecpar;
+    in_time_base = in_fmt_ctx->streams[video_stream_index]->time_base;
+    in_framerate = in_fmt_ctx->streams[video_stream_index]->avg_frame_rate;
 
     // 编码器：NVENC 硬编
     encoder = avcodec_find_encoder_by_name("h264_nvenc");
@@ -209,15 +272,8 @@ int main(int argc, char* argv[]) {
     img_h = enc_ctx->height;
 
     // 输出 RTMP
-    avformat_alloc_output_context2(&out_fmt_ctx, NULL, "flv", output_url);
-    out_stream = avformat_new_stream(out_fmt_ctx, NULL);
-    out_stream->time_base = (AVRational){1, 1000};
-    avcodec_parameters_from_context(out_stream->codecpar, enc_ctx);
-    if (avio_open(&out_fmt_ctx->pb, output_url, AVIO_FLAG_WRITE) < 0) {
-        printf("Open RTMP fail\n"); ret = -1; goto cleanup;
-    }
-    if (avformat_write_header(out_fmt_ctx, NULL) < 0) {
-        printf("Write header fail\n"); ret = -1; goto cleanup;
+    if (!open_rtmp_output(&out_fmt_ctx, &out_stream, enc_ctx, output_url)) {
+        printf("[RTMP] Open failed\n"); ret = -1; goto cleanup;
     }
 
     // SwsContext：YUV <-> BGR
@@ -238,21 +294,204 @@ int main(int argc, char* argv[]) {
     enc_frame->width  = img_w;
     enc_frame->height = img_h;
     av_frame_get_buffer(enc_frame, 0);
+    last_frame = av_frame_alloc();
+    last_frame->format = AV_PIX_FMT_YUV420P;
+    last_frame->width  = img_w;
+    last_frame->height = img_h;
+    av_frame_get_buffer(last_frame, 0);
 
     in_pkt    = av_packet_alloc();
     out_pkt   = av_packet_alloc();
     dec_frame = av_frame_alloc();
 
+    // ==================== 转码主循环 ====================
     printf("[Pipeline] Begin AI transcode: %s -> %s\n", input_url, output_url);
 
-    // ==================== 转码主循环 ====================
-    while (av_read_frame(in_fmt_ctx, in_pkt) >= 0) {
-        if (in_pkt->stream_index != video_stream_index) { av_packet_unref(in_pkt); continue; }
+    while (true) {
+        int read_ret = av_read_frame(in_fmt_ctx, in_pkt);
 
-        if (avcodec_send_packet(dec_ctx, in_pkt) < 0) { av_packet_unref(in_pkt); continue; }
+        if (read_ret == AVERROR(EAGAIN)) {
+            av_usleep(1000);   // 1ms
+            continue;
+        }
+
+        if (read_ret < 0) {
+            // ==================== 断线重连 ====================
+            printf("[RTSP] Stream disconnected (%s), reconnecting...\n",
+                   av_err2str(read_ret));
+
+            // 清理输入相关资源（保留编码器和 RTMP 输出）
+            avcodec_free_context(&dec_ctx);
+            avformat_close_input(&in_fmt_ctx);
+
+            // ==================== 重连循环（带心跳） ====================
+            int reconn = 0;
+            while (!open_rtsp_input(&in_fmt_ctx, &dec_ctx, input_url, video_stream_index)) {
+                reconn++;
+                printf("[RTSP] Reconnect failed (attempt %d), retrying...\n", reconn);
+
+                // ★ 心跳：每 1/3 秒推一帧缓存画面，避免 SRS 踢下线
+                if (has_last_frame) {
+                    int heartbeat_frames = RECONNECT_DELAY_SEC * 3;   // 3 fps
+                    for (int i = 0; i < heartbeat_frames; i++) {
+                        av_frame_make_writable(last_frame);
+                        // 用真实时间计算 PTS，保证单调递增，不会发生时间戳倒退
+                        int64_t heartbeat_us = av_gettime_relative() - stream_start_us;
+                        last_frame->pts = av_rescale_q(heartbeat_us, {1, 1000000}, enc_ctx->time_base);
+                        send_ret = avcodec_send_frame(enc_ctx, last_frame);
+                        while (send_ret == AVERROR(EAGAIN)) {
+                            if (avcodec_receive_packet(enc_ctx, out_pkt) == 0) {
+                                out_pkt->stream_index = out_stream->index;
+                                av_packet_rescale_ts(out_pkt, enc_ctx->time_base, out_stream->time_base);
+                                int wret = av_interleaved_write_frame(out_fmt_ctx, out_pkt);
+                                if (wret == AVERROR(EPIPE) || wret == AVERROR(ECONNRESET)) {
+                                    printf("[RTMP] heartbeat failed, reconnecting RTMP...\n");
+                                    int retry = 0;
+                                    while (!open_rtmp_output(&out_fmt_ctx, &out_stream, enc_ctx, output_url)) {
+                                        retry++;
+                                        printf("[RTMP] Reconnect failed (attempt %d), retrying in 1s...\n", retry);
+                                        av_usleep(1000000);
+                                    }
+                                    printf("[RTMP] Reconnected successfully!\n");
+                                } 
+                                av_packet_unref(out_pkt);
+                            }
+                            send_ret = avcodec_send_frame(enc_ctx, last_frame);
+                        }
+                        while (avcodec_receive_packet(enc_ctx, out_pkt) == 0) {
+                            out_pkt->stream_index = out_stream->index;
+                            av_packet_rescale_ts(out_pkt, enc_ctx->time_base, out_stream->time_base);
+                            int wret = av_interleaved_write_frame(out_fmt_ctx, out_pkt);
+                            if (wret == AVERROR(EPIPE) || wret == AVERROR(ECONNRESET)) {
+                                printf("[RTMP] heartbeat failed, reconnecting RTMP...\n");
+                                int retry = 0;
+                                while (!open_rtmp_output(&out_fmt_ctx, &out_stream, enc_ctx, output_url)) {
+                                    retry++;
+                                    printf("[RTMP] Reconnect failed (attempt %d), retrying in 1s...\n", retry);
+                                    av_usleep(1000000);
+                                }
+                                printf("[RTMP] Reconnected successfully!\n");
+                            }
+                            av_packet_unref(out_pkt);
+                        }
+                        av_usleep(333333);   // 1/3 秒
+                    }
+                } else {
+                    // 还没有任何帧缓存，纯等待
+                    av_usleep(RECONNECT_DELAY_SEC * 1000000);
+                }
+            }
+            printf("[RTSP] Reconnected after %d failed attempts\n", reconn);
+
+            just_reconnected = true;
+            waiting_for_keyframe = true;
+            dec_ctx->skip_frame = AVDISCARD_NONKEY;
+                        // ==================== 重连后检查输入流参数变化 ====================
+            if (dec_ctx->width != img_w || dec_ctx->height != img_h) {
+                printf("[RTSP] Resolution changed: %dx%d -> %dx%d, rebuilding FULL pipeline\n",
+                       img_w, img_h, dec_ctx->width, dec_ctx->height);
+
+                // 1. 清理旧的资源
+                if (enc_frame) av_frame_free(&enc_frame);
+                if (enc_ctx) avcodec_free_context(&enc_ctx);
+                if (sws_yuv2bgr) sws_freeContext(sws_yuv2bgr);
+                if (sws_bgr2yuv) sws_freeContext(sws_bgr2yuv);
+                if (bgr_buffer) av_free(bgr_buffer);
+                if (last_frame) av_frame_free(&last_frame);
+                if (out_fmt_ctx) {
+                    if (out_fmt_ctx->pb) avio_closep(&out_fmt_ctx->pb);
+                    avformat_free_context(out_fmt_ctx);
+                    out_fmt_ctx = NULL;
+                }
+
+                // 2. 更新尺寸
+                img_w = dec_ctx->width;
+                img_h = dec_ctx->height;
+                has_last_frame = false;
+
+                // 3. 重建 NVENC 编码器
+                enc_ctx = avcodec_alloc_context3(encoder);
+                enc_ctx->width  = img_w;
+                enc_ctx->height = img_h;
+                if (in_framerate.num > 0 && in_framerate.den > 0) {
+                    enc_ctx->framerate = in_framerate;
+                    enc_ctx->time_base = av_inv_q(in_framerate);
+                } else {
+                    enc_ctx->framerate = (AVRational){30, 1};
+                    enc_ctx->time_base = (AVRational){1, 30};
+                }
+                enc_ctx->pix_fmt      = AV_PIX_FMT_YUV420P;
+                enc_ctx->bit_rate     = 4000000;
+                enc_ctx->gop_size     = 30;
+                enc_ctx->max_b_frames = 0;
+                enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+                if (avcodec_open2(enc_ctx, encoder, NULL) < 0) { 
+                    printf("Rebuild NVENC fail\n"); ret = -1; goto cleanup; 
+                }
+
+                // 4. 重建 RTMP 输出 (这里调用我们上一轮写的 open_rtmp_output 函数)
+                if (!open_rtmp_output(&out_fmt_ctx, &out_stream, enc_ctx, output_url)) {
+                    printf("Rebuild RTMP fail\n"); ret = -1; goto cleanup;
+                }
+
+                // 5. 重建 SwsContext 和 BGR 缓冲区
+                sws_yuv2bgr = sws_getContext(img_w, img_h, dec_ctx->pix_fmt,
+                                             img_w, img_h, AV_PIX_FMT_BGR24,
+                                             SWS_BILINEAR, NULL, NULL, NULL);
+                sws_bgr2yuv = sws_getContext(img_w, img_h, AV_PIX_FMT_BGR24,
+                                             img_w, img_h, AV_PIX_FMT_YUV420P,
+                                             SWS_BILINEAR, NULL, NULL, NULL);
+                bgr_buffer = (uint8_t*)av_malloc(img_w * img_h * 3);
+                bgr_data[0] = bgr_buffer;
+                bgr_linesize[0] = img_w * 3;
+
+                // 6. 重建编码帧
+                enc_frame = av_frame_alloc();
+                enc_frame->format = AV_PIX_FMT_YUV420P;
+                enc_frame->width  = img_w;
+                enc_frame->height = img_h;
+                av_frame_get_buffer(enc_frame, 0);
+
+                // 7. 重建心跳缓存帧
+                last_frame = av_frame_alloc();
+                last_frame->format = AV_PIX_FMT_YUV420P;
+                last_frame->width  = img_w;
+                last_frame->height = img_h;
+                av_frame_get_buffer(last_frame, 0);
+
+                printf("[RTSP] Pipeline rebuilt for %dx%d\n", img_w, img_h);
+            }
+            // 更新输入流参数
+            in_codecpar  = in_fmt_ctx->streams[video_stream_index]->codecpar;
+            in_time_base = in_fmt_ctx->streams[video_stream_index]->time_base;
+            in_framerate = in_fmt_ctx->streams[video_stream_index]->avg_frame_rate;
+
+            avformat_flush(in_fmt_ctx);  // ★ 新增：清空由于网络爆发缓存的旧包
+            continue;
+        }
+        // ==================== 正常处理 ====================
+        if (in_pkt->stream_index != video_stream_index) {
+            av_packet_unref(in_pkt);
+            continue;
+        }
+        if (avcodec_send_packet(dec_ctx, in_pkt) < 0) {
+            av_packet_unref(in_pkt);
+            continue;
+        }
         av_packet_unref(in_pkt);
 
         while (avcodec_receive_frame(dec_ctx, dec_frame) == 0) {
+            // 重连后等待第一个关键帧
+            if (waiting_for_keyframe) {
+                if (dec_frame->flags & AV_FRAME_FLAG_KEY) {
+                    printf("[RTSP] Got first keyframe after reconnect\n");
+                    waiting_for_keyframe = false;
+                    dec_ctx->skip_frame = AVDISCARD_DEFAULT;
+                } else {
+                    av_frame_unref(dec_frame);
+                    continue;
+                }
+            }
             // 1. YUV -> BGR
             sws_scale(sws_yuv2bgr, dec_frame->data, dec_frame->linesize, 0, img_h,
                       bgr_data, bgr_linesize);
@@ -341,34 +580,98 @@ int main(int argc, char* argv[]) {
             sws_scale(sws_bgr2yuv, bgr_data, bgr_linesize, 0, img_h,
                       enc_frame->data, enc_frame->linesize);
 
-            // 9. PTS：线性递增，避免输入时间戳乱序导致花屏
-            enc_frame->pts = pts_counter++;
+            // ★ 缓存当前帧，用于断流期间的"心跳"
+            av_frame_make_writable(last_frame);
+            av_frame_copy(last_frame, enc_frame);
+            has_last_frame = true;
 
+            // 9. PTS：用真实时间计算，断流重连后 PTS 会自动跳到当前时刻
+            int64_t elapsed_us = av_gettime_relative() - stream_start_us;
+            enc_frame->pts = av_rescale_q(elapsed_us, {1, 1000000}, enc_ctx->time_base);
+            if (just_reconnected) {
+                enc_frame->pict_type = AV_PICTURE_TYPE_I;
+                just_reconnected = false;
+            }
             // 10. 发送到编码器
             send_ret = avcodec_send_frame(enc_ctx, enc_frame);
             while (send_ret == AVERROR(EAGAIN)) {
                 if (avcodec_receive_packet(enc_ctx, out_pkt) == 0) {
                     out_pkt->stream_index = out_stream->index;
                     av_packet_rescale_ts(out_pkt, enc_ctx->time_base, out_stream->time_base);
+                    // --- 统一处理 RTMP 推流失败 ---
                     write_ret = av_interleaved_write_frame(out_fmt_ctx, out_pkt);
-                    if (write_ret < 0) printf("push fail: %d\n", write_ret);
+                    if (write_ret < 0) {
+                        rtmp_fail_count++;
+                        printf("[RTMP] push fail: %d (total %d)\n", write_ret, rtmp_fail_count);
+                        
+                        if (rtmp_fail_count >= 5) {
+                            printf("[RTMP] Connection lost, reconnecting RTMP...\n");
+                            rtmp_fail_count = 0;
+
+                            // 重建 RTMP 连接
+                            int retry = 0;
+                            while (!open_rtmp_output(&out_fmt_ctx, &out_stream, enc_ctx, output_url)) {
+                                retry++;
+                                printf("[RTMP] Reconnect failed (attempt %d), retrying in 1s...\n", retry);
+                                av_usleep(1000000);
+                            }
+                            printf("[RTMP] Reconnected successfully!\n");
+                        }
+                    } else {
+                        rtmp_fail_count = 0;
+                    }
                     av_packet_unref(out_pkt);
                     frame_count++;
                 }
                 send_ret = avcodec_send_frame(enc_ctx, enc_frame);
             }
-
             // 11. 接收编码后的包
             while (avcodec_receive_packet(enc_ctx, out_pkt) == 0) {
                 out_pkt->stream_index = out_stream->index;
                 av_packet_rescale_ts(out_pkt, enc_ctx->time_base, out_stream->time_base);
+                // --- 统一处理 RTMP 推流失败 ---
                 write_ret = av_interleaved_write_frame(out_fmt_ctx, out_pkt);
-                if (write_ret < 0) printf("push fail: %d\n", write_ret);
+                if (write_ret < 0) {
+                    rtmp_fail_count++;
+                    printf("[RTMP] push fail: %d (total %d)\n", write_ret, rtmp_fail_count);
+                    if (rtmp_fail_count >= 5) {
+                        printf("[RTMP] Connection lost, reconnecting RTMP...\n");
+                        rtmp_fail_count = 0;
+
+                        // 重建 RTMP 连接
+                        int retry = 0;
+                        while (!open_rtmp_output(&out_fmt_ctx, &out_stream, enc_ctx, output_url)) {
+                            retry++;
+                            printf("[RTMP] Reconnect failed (attempt %d), retrying in 1s...\n", retry);
+                            av_usleep(1000000);
+                        }
+                        printf("[RTMP] Reconnected successfully!\n");
+                    }
+                } else {
+                    rtmp_fail_count = 0;
+                }
                 av_packet_unref(out_pkt);
                 frame_count++;
             }
 
             av_frame_unref(dec_frame);
+
+            // ★ 帧率控制 (Pacing)：防止重连瞬间数据爆发导致 ffplay 卡顿
+            int fps = 30;
+            if (in_framerate.num > 0 && in_framerate.den > 0) {
+                fps = in_framerate.num / in_framerate.den;
+                if (fps <= 0 || fps > 120) fps = 30; // 防御性保护
+            }
+            int64_t frame_duration_us = 1000000 / fps;
+            
+            next_frame_time_us += frame_duration_us;
+            int64_t now_us = av_gettime_relative();
+            if (next_frame_time_us > now_us) {
+                av_usleep(next_frame_time_us - now_us);
+            } else {
+                // 如果处理速度远慢于实时（比如机器太卡），重置基准时间，避免死命追赶
+                next_frame_time_us = now_us;
+            }
         }
     }
 
@@ -391,6 +694,7 @@ cleanup:
     if (out_pkt) av_packet_free(&out_pkt);
     if (dec_frame) av_frame_free(&dec_frame);
     if (enc_frame) av_frame_free(&enc_frame);
+    if (last_frame) av_frame_free(&last_frame);
     if (dec_ctx) avcodec_free_context(&dec_ctx);
     if (enc_ctx) avcodec_free_context(&enc_ctx);
     if (out_fmt_ctx) {
