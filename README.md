@@ -201,10 +201,10 @@ Per-box decoding:
 - [x] RTSP input, NVENC output
 - [x] YOLOv8 inference via ONNX Runtime CUDA
 - [x] Bounding box overlay with OpenCV
-- [ ] RTSP auto-reconnect on network drop
-- [ ] Frame rate pacing for live streams
+- [x] RTSP auto-reconnect on network drop
+- [x] Frame rate pacing for live streams
 - [ ] Multi-stream concurrent processing
-- [ ] Zero-copy GPU pipeline (CUDA ↔ NVENC)
+- [x] Zero-copy GPU pipeline (CUDA ↔ NVENC)
 - [ ] WebRTC (WHIP/WHEP) output support
 
 ---
